@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any
-
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -40,16 +38,12 @@ from torchtitan.distributed.expert_parallel import (
     TensorParallel,
     TorchAOExpertParallel,
 )
-from torchtitan.distributed.fsdp import (
-    disable_fsdp_gradient_division,
-    get_fsdp_reshard_after_forward_policy,
-)
+from torchtitan.distributed.fsdp import apply_fsdp_to_model
 from torchtitan.distributed.tensor_parallel import (
     ColwiseParallelWithGradPlacement,
     maybe_enable_async_tp,
     NoParallel,
 )
-
 from torchtitan.models.llama4.model import Llama4Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -136,7 +130,6 @@ def parallelize_llama(
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             comm_backend=comm_backend,
             hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
-            enable_sp=True,
             pad_multiple=pad_multiple,
         )
 
@@ -186,6 +179,7 @@ def parallelize_llama(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
+        gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -310,203 +304,40 @@ def apply_fsdp(
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
+    gradient_divide_factor: int | None = None,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
 
-    Args:
-        model (nn.Module): The model to apply data parallelism to.
-        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
-        param_dtype (torch.dtype): The data type to use for model parameters.
-        reduce_dtype (torch.dtype): The data type to use for reduction operations.
-        pp_enabled (bool): Whether pipeline parallelism is enabled.
-        cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
-        reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
-            Other options: "never", "always".
-            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
-            - "always" will enable `reshard_after_forward` for all forward passes.
-            - "never" will disable `reshard_after_forward` for all forward passes.
+    This is a model-specific wrapper around `apply_fsdp_to_model` from
+    `torchtitan.distributed.fsdp`. It supports both standard Transformer
+    and MoE (Mixture of Experts) models.
 
+    Args:
+        model: The model to apply data parallelism to.
+        dp_mesh: The device mesh to use for data parallelism.
+        param_dtype: The data type to use for model parameters.
+        reduce_dtype: The data type to use for reduction operations.
+        pp_enabled: Whether pipeline parallelism is enabled.
+        cpu_offload: Whether to offload model parameters to CPU. Defaults to False.
+        reshard_after_forward_policy: The policy for resharding after forward pass.
+            Defaults to "default".
+        ep_degree: Expert parallelism degree. Defaults to 1 (no EP).
+        edp_mesh: Device mesh for expert data parallelism (used when ep_degree > 1).
+        gradient_divide_factor: Optional factor for gradient division.
     """
-    mp_policy = MixedPrecisionPolicy(
+    apply_fsdp_to_model(
+        model,
+        dp_mesh,
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
+        pp_enabled=pp_enabled,
+        cpu_offload=cpu_offload,
+        reshard_after_forward_policy=reshard_after_forward_policy,
+        ep_degree=ep_degree,
+        edp_mesh=edp_mesh,
+        gradient_divide_factor=gradient_divide_factor,
     )
-    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        reshard_after_forward_policy, pp_enabled
-    )
-
-    if getattr(model, "enable_weight_tying", False):
-        modules = [
-            m for m in (model.tok_embeddings, model.norm, model.output) if m is not None
-        ]
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            modules,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
-        )
-    else:
-        if model.tok_embeddings is not None:
-            # pyrefly: ignore [no-matching-overload]
-            fully_shard(
-                model.tok_embeddings,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-        if model.norm is not None and model.output is not None:
-            # As an optimization, do not reshard_after_forward the last layers by default
-            # since FSDP would prefetch them immediately after the forward pass
-            # pyrefly: ignore [no-matching-overload]
-            fully_shard(
-                [model.norm, model.output],
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward_policy == "always",
-            )
-
-    # pyrefly: ignore [missing-attribute]
-    for layer_id, transformer_block in model.layers.items():
-        # NOTE: In an MoE layer, we use shard_placement_fn to apply different
-        # FSDP mesh and shard placement to different parameters:
-        # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh
-        # - When EP = 1: all params use the same FSDP mesh, but experts may
-        #   use Shard(1) when FSDP degree > num_experts to avoid padding
-        if transformer_block.moe_enabled:
-            assert hasattr(transformer_block, "moe")
-            expert_params = set(transformer_block.moe.experts.parameters())
-            num_experts = transformer_block.moe.experts.num_experts
-
-            if ep_degree > 1:
-                assert edp_mesh is not None
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
-            else:
-                efsdp_ep_size = fsdp_config["mesh"].size()
-
-            if efsdp_ep_size > num_experts:
-                expert_shard_placement = Shard(1)
-            else:
-                expert_shard_placement = Shard(0)
-
-            # When ep_degree == 1 and no Shard(1) override needed, skip
-            # shard_placement_fn entirely for simplicity
-            if ep_degree == 1 and expert_shard_placement == Shard(0):
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                )
-            elif ep_degree == 1:
-                # ep_degree == 1 but need Shard(1) for experts to avoid padding
-                def _experts_shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                ) -> Shard | None:
-                    if param in _expert_params:
-                        return Shard(1)
-                    return None
-
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_experts_shard_placement_fn,
-                )
-            else:
-                # ep_degree > 1: per-param mesh
-                from torch.distributed.fsdp._fully_shard._fsdp_common import (
-                    FSDPMeshInfo,
-                    ShardPlacementResult,
-                )
-
-                assert edp_mesh is not None
-                edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
-                dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
-
-                def _shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                    _expert_placement: Shard = expert_shard_placement,
-                    _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
-                    _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
-                ) -> ShardPlacementResult:
-                    if param in _expert_params:
-                        return ShardPlacementResult(
-                            placement=_expert_placement, mesh_info=_edp_mesh_info
-                        )
-                    else:
-                        return ShardPlacementResult(
-                            placement=Shard(0), mesh_info=_dp_mesh_info
-                        )
-
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
-                )
-        else:
-            fully_shard(
-                transformer_block,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-
-    fully_shard(model, **fsdp_config)
-
-    # Disable FSDP's automatic gradient division for all FSDP modules
-    disable_fsdp_gradient_division(model)
-
-    # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
-    # in EP could interfere with implicit prefetching in FSDP
-    if ep_degree == 1:
-        return
-
-    # forward
-    # pyrefly: ignore [not-callable]
-    transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
-
-    # pyrefly: ignore [bad-argument-type]
-    if model.tok_embeddings is not None and len(model.layers) > 0:
-        # pyrefly: ignore [missing-attribute]
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
-
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif model.norm is not None and model.output is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.output]
-            )
-
-    # backward
-    # pyrefly: ignore [not-callable]
-    reversed_transformer_blocks = list(reversed(model.layers.values()))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
-
-    # pyrefly: ignore [bad-argument-type]
-    if model.norm is not None and model.output is not None and len(model.layers) > 0:
-        # pyrefly: ignore [missing-attribute]
-        model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
-
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
 def apply_moe_ep_tp(
@@ -517,12 +348,9 @@ def apply_moe_ep_tp(
     ep_etp_mesh: DeviceMesh | None,
     comm_backend: str = "standard",
     hybridep_non_blocking_expert_capacity_factor: float | None = None,
-    enable_sp: bool = True,
     pad_multiple: int | None = None,
 ):
     assert ep_mesh is not None or tp_mesh is not None
-
-    sp_layout = Shard(1) if enable_sp else Replicate()
 
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
@@ -532,16 +360,15 @@ def apply_moe_ep_tp(
 
         if tp_mesh is not None:
             moe_layer_plan = {
-                # With SP: all-gather (Shard→Replicate) for input,
-                # reduce-scatter (Partial→Shard) for output.
-                # Without SP: input is already Replicate,
-                # all-reduce (Partial→Replicate) for output.
+                # input / output sharding on the seqlen dim
+                # all-gather for input, reduce-scatter for output
                 "moe": PrepareModuleInputOutput(
-                    input_layouts=(sp_layout,),
+                    input_layouts=(Shard(1),),
                     desired_input_layouts=(Replicate(),),
+                    # Keep input as a DTensor from SequenceParallel, do not wrap with to_local.
                     use_local_input=False,
                     output_layouts=(Partial(),),
-                    desired_output_layouts=(sp_layout,),
+                    desired_output_layouts=(Shard(1),),
                 ),
                 # replicate computation for the router
                 "moe.router.gate": NoParallel(

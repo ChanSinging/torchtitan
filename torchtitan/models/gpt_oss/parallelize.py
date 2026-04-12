@@ -35,6 +35,7 @@ from torchtitan.distributed.expert_parallel import (
     ReordererSequenceParallel,
     TorchAOExpertParallel,
 )
+from torchtitan.distributed.fsdp import apply_fsdp_to_model, apply_replicate_to_model
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.models.gpt_oss.model import GptOssModel
 from torchtitan.models.llama4.parallelize import apply_fsdp
@@ -106,7 +107,6 @@ def parallelize_gptoss(
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             etp_enabled=parallel_dims.etp_enabled,
             pad_multiple=pad_multiple,
-            enable_sp=True,
         )
 
     if parallel_dims.cp_enabled:
@@ -141,25 +141,32 @@ def parallelize_gptoss(
         )
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-    apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=parallel_dims.ep,
-        edp_mesh=edp_mesh,
-    )
+        apply_fsdp_to_model(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
+            edp_mesh=edp_mesh,
+        )
 
     logger.info("Applied fully_shard to the model")
 
     if parallel_dims.cp_enabled:
         logger.info("Applied Context Parallel to the model")
 
-    if training.enable_cpu_offload:
-        logger.info("Applied CPU Offloading to the model")
+        if training.enable_cpu_offload:
+            logger.info("Applied CPU Offloading to the model")
+    elif parallel_dims.dp_replicate_enabled:
+        apply_replicate_to_model(
+            model,
+            parallel_dims.get_mesh("dp_replicate"),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        )
 
     return model
 
@@ -251,11 +258,8 @@ def apply_moe_ep_tp(
     ep_etp_mesh: DeviceMesh | None,
     etp_enabled: bool,
     pad_multiple: int | None = None,
-    enable_sp: bool = True,
 ):
     assert ep_mesh is not None or tp_mesh is not None
-
-    sp_layout = Shard(1) if enable_sp else Replicate()
 
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
@@ -265,17 +269,15 @@ def apply_moe_ep_tp(
 
         if tp_mesh is not None:
             moe_layer_plan = {
-                # With SP: all-gather (Shard→Replicate) for input,
-                # reduce-scatter (Partial→Shard) for output.
-                # Without SP: input is already Replicate,
-                # all-reduce (Partial→Replicate) for output.
+                # input / output sharding on the seqlen dim
+                # all-gather for input, reduce-scatter for output
                 "moe": PrepareModuleInputOutput(
-                    input_layouts=(sp_layout,),
+                    input_layouts=(Shard(1),),
                     desired_input_layouts=(Replicate(),),
                     # Keep input as a DTensor from SequenceParallel, do not wrap with to_local.
                     use_local_input=False,
                     output_layouts=(Partial(),),
-                    desired_output_layouts=(sp_layout,),
+                    desired_output_layouts=(Shard(1),),
                 ),
                 # replicate computation for the router
                 "moe.router.gate": NoParallel(

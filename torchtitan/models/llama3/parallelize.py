@@ -9,8 +9,8 @@
 
 import torch
 import torch.nn as nn
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -32,10 +32,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.compile import apply_compile_dense
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
-from torchtitan.distributed.fsdp import (
-    disable_fsdp_gradient_division,
-    get_fsdp_reshard_after_forward_policy,
-)
+from torchtitan.distributed.fsdp import apply_fsdp_to_model, apply_replicate_to_model
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
@@ -253,72 +250,51 @@ def apply_fsdp(
     """
     Apply data parallelism (via FSDP2) to the model.
 
-    Args:
-        model (nn.Module): The model to apply data parallelism to.
-        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
-        param_dtype (torch.dtype): The data type to use for model parameters.
-        reduce_dtype (torch.dtype): The data type to use for reduction operations.
-        pp_enabled (bool): Whether pipeline parallelism is enabled.
-        cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
-        reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
-            Other options: "never", "always".
-            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
-            - "always" will enable `reshard_after_forward` for all forward passes.
-            - "never" will disable `reshard_after_forward` for all forward passes.
+    This is a model-specific wrapper around `apply_fsdp_to_model` from
+    `torchtitan.distributed.fsdp`.
 
+    Args:
+        model: The model to apply data parallelism to.
+        dp_mesh: The device mesh to use for data parallelism.
+        param_dtype: The data type to use for model parameters.
+        reduce_dtype: The data type to use for reduction operations.
+        pp_enabled: Whether pipeline parallelism is enabled.
+        cpu_offload: Whether to offload model parameters to CPU. Defaults to False.
+        reshard_after_forward_policy: The policy for resharding after forward pass.
+            Defaults to "default".
     """
-    mp_policy = MixedPrecisionPolicy(
+    apply_fsdp_to_model(
+        model,
+        dp_mesh,
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-    )
-    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        # pyrefly: ignore[bad-typed-dict-key]
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        reshard_after_forward_policy, pp_enabled
+        pp_enabled=pp_enabled,
+        cpu_offload=cpu_offload,
+        reshard_after_forward_policy=reshard_after_forward_policy,
     )
 
-    if getattr(model, "enable_weight_tying", False):
-        # When weights are tied, tok_embeddings and output share the same parameter.
-        # Group them together in one FSDP unit to avoid duplicate all-gathers.
-        modules = [
-            m for m in (model.tok_embeddings, model.norm, model.output) if m is not None
-        ]
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            modules,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
-        )
-    else:
-        if model.tok_embeddings is not None:
-            # pyrefly: ignore [no-matching-overload]
-            fully_shard(
-                model.tok_embeddings,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-        # As an optimization, do not reshard_after_forward the last layers by default
-        # since FSDP would prefetch them immediately after the forward pass
-        if model.norm is not None and model.output is not None:
-            # pyrefly: ignore [no-matching-overload]
-            fully_shard(
-                [model.norm, model.output],
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward_policy == "always",
-            )
-    # pyrefly: ignore [missing-attribute]
-    for layer_id, transformer_block in model.layers.items():
-        fully_shard(
-            transformer_block,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
 
-    fully_shard(model, **fsdp_config)
+def apply_replicate(
+    model: nn.Module,
+    dp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+):
+    """
+    Apply data parallelism via replication (HSDP) to the model.
 
-    # Disable FSDP's automatic gradient division for all FSDP modules
-    disable_fsdp_gradient_division(model)
+    This is a model-specific wrapper around `apply_replicate_to_model` from
+    `torchtitan.distributed.fsdp`.
+
+    Args:
+        model: The model to apply replication to.
+        dp_mesh: The device mesh for data parallelism.
+        param_dtype: The data type for model parameters.
+        reduce_dtype: The data type for reduction operations.
+    """
+    apply_replicate_to_model(
+        model,
+        dp_mesh,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+    )
