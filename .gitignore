@@ -52,3 +52,7 @@ CLAUDE_CONTEXT/
 
 /openSpec
 /.claude
+/.claude
+
+# openSpec local
+/.github
